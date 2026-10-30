@@ -1,0 +1,209 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - beta
+      - 'release/*'
+      - 'hotfix/*'
+      # 本仓库的 GitFlow 版本分支（如 2.1.0、2.2.0）
+      - '[0-9]*.[0-9]*.[0-9]*'
+    tags:
+      - 'v*'
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+# 流水线说明（参照 Build Beta 工作流的模式）：
+#
+# 1. 推送到 GitFlow 分支（main / develop / beta / release/* / hotfix/* / X.Y.Z 版本分支）：
+#    构建 JAR → 自动创建 GitHub Pre-release，tag 形如 v<版本>-beta.<run_number>，
+#    并把「插件 JAR + MD5 校验文件」一并上传为预发布附件，供下载验证。
+#
+# 2. 推送 tag（v* 或 X.Y.Z，如 2.1.0）：构建 JAR → 以该 tag 自动创建正式 Release，
+#    并把「插件 JAR + MD5 校验文件」上传到 Release 下载区。
+#
+# 权限最小化：默认只读，仅 Release 任务提权到 contents: write（创建 Release 需要）。
+permissions:
+  contents: read
+
+jobs:
+  Build:
+    name: Build JAR
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out git repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      # 读取 pom.xml 的项目版本（供分支构建的 Pre-release tag 命名使用）
+      - name: Read project version
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+      # build.sh 会先生成 Rapture 前端 bundle，再执行 mvn package 打出 OSGi bundle JAR
+      - name: Build with Maven
+        run: chmod +x build.sh && ./build.sh clean package
+
+      - name: Run tests
+        run: mvn test
+
+      # 为主 JAR 生成 MD5 校验文件，一并作为 Release 附件，供下载后校验完整性
+      - name: Generate MD5 checksum
+        run: |
+          cd target
+          for f in *.jar; do
+            case "$f" in *-sources.jar|*-javadoc.jar) continue ;; esac
+            md5sum "$f" > "$f.md5"
+            echo "MD5 ($f)："
+            cat "$f.md5"
+          done
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nexus-artifacts-promotion-plugin
+          path: |
+            target/*.jar
+            target/*.jar.md5
+            !target/*-sources.jar
+            !target/*-javadoc.jar
+          if-no-files-found: error
+
+  Release:
+    name: Create Release
+    needs: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: nexus-artifacts-promotion-plugin
+          path: dist
+
+      - name: List release files
+        run: ls -lh dist
+
+      # 计算本次发布使用的 tag：
+      # - tag 推送：直接使用被推送的 tag（tag 已存在，Release 挂到该 tag 上）
+      # - 分支推送：v<版本>-beta.<run_number>（run_number 递增保证每次构建的 tag 唯一，互不覆盖）
+      - name: Compute release tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="v${{ needs.Build.outputs.version }}-beta.${{ github.run_number }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "发布 tag：$TAG"
+
+      # tag 推送 → 以该 tag 创建正式 Release
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Nexus Artifacts Promotion Plugin v${{ github.ref_name }}
+          body: |
+            ## Nexus Artifacts Promotion Plugin v${{ github.ref_name }}
+
+            由 tag `${{ github.ref_name }}` 推送自动构建并发布的正式版本。
+
+            - 提交：`${{ github.sha }}`
+            - 工作流运行：#${{ github.run_number }}
+
+            ### 安装
+
+            下载附件中的插件 JAR（`nexus-artifacts-promotion-plugin-<版本号>.jar`），放入 Nexus 插件目录：
+
+                ${NEXUS_HOME}/system/com/nexus/artifacts/nexus-artifacts-promotion-plugin/<版本号>/
+
+            重启 Nexus 加载插件（`sudo systemctl restart nexus`）。
+            附件同时提供 `.md5` 校验文件，可用于校验下载完整性。
+          # 串行上传（按 files 顺序）。默认并发上传，附件多时容易撞上 GitHub
+          # 「资产元数据延迟可见」的瞬时 404。
+          preserve_order: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      # 分支推送 → 创建 Pre-release
+      - name: Create Pre-release
+        if: startsWith(github.ref, 'refs/heads/')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          # 必须显式指定 target_commitish：该参数默认指向「仓库默认分支」，
+          # 不指定会导致 tag 指向 main 的 HEAD，而不是本次构建的提交
+          target_commitish: ${{ github.sha }}
+          name: v${{ needs.Build.outputs.version }} (build ${{ github.run_number }})
+          body: |
+            ## Nexus Artifacts Promotion Plugin v${{ needs.Build.outputs.version }} (build ${{ github.run_number }})
+
+            由分支 `${{ github.ref_name }}` 推送自动构建的预发布版本，附件为插件 JAR（`nexus-artifacts-promotion-plugin-<版本号>.jar`）及其 MD5 校验文件。
+
+            - 提交：`${{ github.sha }}`
+            - 工作流运行：#${{ github.run_number }}
+
+            ### 安装
+
+            下载附件中的插件 JAR，放入 Nexus 插件目录：
+
+                ${NEXUS_HOME}/system/com/nexus/artifacts/nexus-artifacts-promotion-plugin/<版本号>/
+
+            重启 Nexus 加载插件（`sudo systemctl restart nexus`）。
+          preserve_order: true
+          generate_release_notes: true
+          draft: false
+          prerelease: true
+
+      # 上传完必须核对一次：附件数/文件名要和 dist/ 里准备上传的完全一致，
+      # 防止「步骤成功但 release 上少了附件」的静默失败。
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          find dist -type f | sed 's#.*/##' | sort > expected.txt
+          echo "准备上传的附件（$(wc -l < expected.txt | tr -d ' ') 个）："
+          cat expected.txt
+
+          ok=0
+          for i in $(seq 1 5); do
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' 2>/dev/null | sort > actual.txt || true
+            if diff -q expected.txt actual.txt > /dev/null; then
+              ok=1
+              break
+            fi
+            echo "第 $i 次核对未通过（release 上 $(wc -l < actual.txt | tr -d ' ') 个附件），3 秒后重试…"
+            sleep 3
+          done
+
+          if [ "$ok" != "1" ]; then
+            echo "::error::发布的附件与预期不一致（下面 - 表示缺失、+ 表示多余）："
+            diff -u expected.txt actual.txt || true
+            exit 1
+          fi
+          echo "附件核对通过：$(wc -l < actual.txt | tr -d ' ') 个附件齐全"
