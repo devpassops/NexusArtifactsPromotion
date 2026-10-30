@@ -140,6 +140,13 @@ jobs:
 
             重启 Nexus 加载插件（`sudo systemctl restart nexus`）。
             附件同时提供 `.md5` 校验文件，可用于校验下载完整性。
+          # 附件：插件 JAR + MD5 校验文件。
+          # fail_on_unmatched_files: true 确保通配符没匹配到文件时直接报错，
+          # 而不是静默创建一个没有任何附件的 Release。
+          files: |
+            dist/*.jar
+            dist/*.jar.md5
+          fail_on_unmatched_files: true
           # 串行上传（按 files 顺序）。默认并发上传，附件多时容易撞上 GitHub
           # 「资产元数据延迟可见」的瞬时 404。
           preserve_order: true
@@ -172,6 +179,15 @@ jobs:
                 ${NEXUS_HOME}/system/com/nexus/artifacts/nexus-artifacts-promotion-plugin/<版本号>/
 
             重启 Nexus 加载插件（`sudo systemctl restart nexus`）。
+          # 附件：插件 JAR + MD5 校验文件。
+          # fail_on_unmatched_files: true 确保通配符没匹配到文件时直接报错，
+          # 而不是静默创建一个没有任何附件的 Pre-release。
+          files: |
+            dist/*.jar
+            dist/*.jar.md5
+          fail_on_unmatched_files: true
+          # 串行上传（按 files 顺序）。默认并发上传，附件多时容易撞上 GitHub
+          # 「资产元数据延迟可见」的瞬时 404。
           preserve_order: true
           generate_release_notes: true
           draft: false
@@ -191,8 +207,12 @@ jobs:
 
           ok=0
           for i in $(seq 1 5); do
-            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
-              --jq '.assets[].name' 2>/dev/null | sort > actual.txt || true
+            if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' 2>gh_err.log | sort > actual.txt; then
+              echo "第 $i 次查询 release 失败：$(cat gh_err.log)"
+              sleep 3
+              continue
+            fi
             if diff -q expected.txt actual.txt > /dev/null; then
               ok=1
               break
@@ -204,6 +224,8 @@ jobs:
           if [ "$ok" != "1" ]; then
             echo "::error::发布的附件与预期不一致（下面 - 表示缺失、+ 表示多余）："
             diff -u expected.txt actual.txt || true
+            # 打印 release 当前状态，便于排查（附件列表 / 是否草稿等）
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,isDraft,isPrerelease,assets || true
             exit 1
           fi
           echo "附件核对通过：$(wc -l < actual.txt | tr -d ' ') 个附件齐全"
